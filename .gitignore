@@ -218,4 +218,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 # macOS
-.DS_Store
+.DS_Store"app/ingestion/loader/Customer_Lifetime_Prediction/" 
