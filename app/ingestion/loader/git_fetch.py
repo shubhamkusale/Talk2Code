@@ -1,97 +1,155 @@
 """
-github_fetch.py
+github_api_fetch.py
 
-Handles acquisition of a target GitHub repository for downstream processing
-(chunking, embedding, and RAG-based interaction by the AI agent).
+Fetches repository file contents directly via the GitHub REST API instead
+of doing a full `git clone`. Useful when you only need specific files, or
+want to avoid disk I/O for a shallow clone, before handing content off to
+the chunking/embedding stage of the RAG pipeline.
 
-Usage (from elsewhere in the pipeline):
+GitHub's API returns blob content base64-encoded, so this module decodes
+it with Python's built-in `base64` library.
 
-    from app.ingestion.loader.github_fetch import Cloner
+Usage:
 
-    cloner = Cloner(github_url)
-    repo_path = cloner.clone()
-    cloner.list_files()
+    from app.ingestion.loader.github_api_fetch import GitHubAPIFetcher
+
+    fetcher = GitHubAPIFetcher(github_url, token=os.getenv("GITHUB_TOKEN"))
+    files = fetcher.fetch_all_files()   # {relative_path: file_content_str}
 """
+from dotenv import load_dotenv
+load_dotenv()
 
+import base64
 import os
-import shutil
-import subprocess
+import re
+from typing import Dict, List, Optional
+
+import requests
+
+API_ROOT = "https://api.github.com"
+
+# Extensions we generally don't want to spend API calls / embeddings on.
+DEFAULT_IGNORED_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
+    ".pdf", ".zip", ".tar", ".gz", ".rar",
+    ".lock", ".log",
+    ".woff", ".woff2", ".ttf", ".eot",
+    ".exe", ".dll", ".so", ".bin",
+    ".mp3", ".mp4", ".mov", ".avi",
+}
 
 
-class Cloner:
-    """Handles shallow-cloning of a GitHub repo to a local destination,
-    keeping the clone outside this project's own repo so it doesn't
-    pollute version control or get mistaken for project source.
+class GitHubAPIFetcher:
+    """Fetches a repo's file tree and blob contents via the GitHub API."""
+
+    def __init__(self, github_url: str, token: Optional[str] = None, branch: Optional[str] = None):
+        self.owner, self.repo = self._parse_owner_repo(github_url)
+        self.token = token
+        self.branch = branch or self._get_default_branch()
+
+    @staticmethod
+    def _parse_owner_repo(github_url: str) -> tuple:
+        """Extract (owner, repo) from a GitHub URL, e.g.
+        https://github.com/owner/repo.git -> ("owner", "repo")
+        """
+        match = re.search(r"github\.com/([^/]+)/([^/.]+)", github_url)
+        if not match:
+            raise ValueError(f"Could not parse owner/repo from URL: {github_url}")
+        return match.group(1), match.group(2)
+
+    def _headers(self) -> dict:
+        headers = {"Accept": "application/vnd.github+json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        return headers
+
+    def _get_default_branch(self) -> str:
+        url = f"{API_ROOT}/repos/{self.owner}/{self.repo}"
+        response = requests.get(url, headers=self._headers())
+        response.raise_for_status()
+        return response.json()["default_branch"]
+
+    def get_file_tree(self) -> list:
+        """Return the full recursive file tree (list of blob metadata dicts)
+        for the repo's current branch, via the Git Trees API.
+        """
+        url = f"{API_ROOT}/repos/{self.owner}/{self.repo}/git/trees/{self.branch}"
+        response = requests.get(url, headers=self._headers(), params={"recursive": "1"})
+        response.raise_for_status()
+        tree = response.json().get("tree", [])
+        return [entry for entry in tree if entry["type"] == "blob"]
+
+    @staticmethod
+    def filter_tree(
+        tree: List[dict],
+        ignored_extensions: Optional[set] = None,
+    ) -> List[dict]:
+        """Drop blobs whose file extension is in `ignored_extensions`
+        (defaults to DEFAULT_IGNORED_EXTENSIONS) so we don't waste API
+        calls / embeddings on binaries, lockfiles, media, etc.
+        """
+        ignored = ignored_extensions if ignored_extensions is not None else DEFAULT_IGNORED_EXTENSIONS
+        filtered = []
+        for entry in tree:
+            _, ext = os.path.splitext(entry["path"])
+            if ext.lower() not in ignored:
+                filtered.append(entry)
+        return filtered
+
+    def fetch_blob_content(self, sha: str) -> str:
+        """Fetch and base64-decode a single blob's content by its SHA."""
+        url = f"{API_ROOT}/repos/{self.owner}/{self.repo}/git/blobs/{sha}"
+        response = requests.get(url, headers=self._headers())
+        response.raise_for_status()
+        blob = response.json()
+
+        if blob.get("encoding") != "base64":
+            raise ValueError(f"Unexpected encoding for blob {sha}: {blob.get('encoding')}")
+
+        decoded_bytes = base64.b64decode(blob["content"])
+        try:
+            return decoded_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            # Binary file (image, etc.) — caller can decide how to handle this.
+            return ""
+
+    def fetch_all_files(self, ignored_extensions: Optional[set] = None) -> Dict[str, str]:
+        """Fetch every non-ignored file in the repo, returning
+        {relative_path: content}. Binary files that slip through the
+        extension filter are included with empty string content.
+        """
+        tree = self.filter_tree(self.get_file_tree(), ignored_extensions)
+        files = {}
+        for entry in tree:
+            print(f"Fetching {entry['path']}...")
+            files[entry["path"]] = self.fetch_blob_content(entry["sha"])
+        print(f"Fetched {len(files)} files from {self.owner}/{self.repo}@{self.branch}")
+        return files
+
+
+def main():
+    """Temporary CLI entry point for manually testing this module in the
+    terminal. Remove once this is wired into the actual ingestion pipeline.
     """
+    github_url = input("Enter GitHub repo URL: ").strip()
+    if not github_url:
+        print("Error: GitHub URL cannot be empty.")
+        return
 
-    def __init__(self, github_url: str, dest_dir: str = None):
-        self.github_url = github_url
-        self.dest_dir = dest_dir or self._derive_dest_dir(github_url)
+    token = os.getenv("GITHUB_TOKEN")  # optional, raises rate limit if set
 
-    @staticmethod
-    def _derive_dest_dir(github_url: str) -> str:
-        """Derive a destination path from the repo URL, placed outside this
-        project's own git repo (e.g. E:\\Talk2Code\\<repo_name>) rather than
-        relative to wherever this module happens to be imported/run from.
-        """
-        name = github_url.rstrip("/").split("/")[-1]
-        if name.endswith(".git"):
-            name = name[:-4]
+    try:
+        fetcher = GitHubAPIFetcher(github_url, token=token)
+        files = fetcher.fetch_all_files()
+    except (ValueError, requests.HTTPError) as e:
+        print(f"Error: {e}")
+        return
 
-        project_root = Cloner._find_project_root()
-        return os.path.join(project_root, name)
+    print("\nFiles fetched:")
+    for path, content in files.items():
+        preview = content[:60].replace("\n", " ") if content else "(binary or empty)"
+        print(f"  {path}  ->  {preview}...")
 
-    @staticmethod
-    def _find_project_root(start: str = None) -> str:
-        """Walk upward from `start` (default: this file's location) to find
-        the repo's .git folder, then return the folder ONE LEVEL ABOVE it,
-        so cloned repos never end up nested inside this project.
-        """
-        path = os.path.abspath(start or __file__)
-        if os.path.isfile(path):
-            path = os.path.dirname(path)
 
-        while True:
-            if os.path.isdir(os.path.join(path, ".git")):
-                return os.path.dirname(path)
-            parent = os.path.dirname(path)
-            if parent == path:
-                # No .git found; fall back to current working directory.
-                return os.getcwd()
-            path = parent
-
-    def _remove_existing(self) -> None:
-        if os.path.exists(self.dest_dir):
-            print(f"Removing existing directory: {self.dest_dir}")
-            shutil.rmtree(self.dest_dir)
-
-    def _ensure_parent_dir(self) -> None:
-        os.makedirs(os.path.dirname(self.dest_dir) or ".", exist_ok=True)
-
-    def clone(self) -> str:
-        """Shallow-clone the repo, replacing any existing copy at dest_dir."""
-        self._remove_existing()
-        self._ensure_parent_dir()
-
-        print(f"Cloning {self.github_url} into {self.dest_dir} (depth=1)...")
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", self.github_url, self.dest_dir],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"git clone failed: {result.stderr.strip()}")
-
-        print(f"Clone complete: {self.dest_dir}")
-        return self.dest_dir
-
-    def list_files(self) -> list:
-        """Print and return the top-level contents of the cloned repo (like `ls`)."""
-        entries = sorted(os.listdir(self.dest_dir))
-        print(f"\nContents of {self.dest_dir}:")
-        for entry in entries:
-            full_path = os.path.join(self.dest_dir, entry)
-            marker = "/" if os.path.isdir(full_path) else ""
-            print(f"  {entry}{marker}")
-        return entries
+if __name__ == "__main__":
+    main()
