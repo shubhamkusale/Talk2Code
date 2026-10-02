@@ -1,1 +1,12 @@
-gitpython
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+python-dotenv==1.1.1
+requests==2.34.2
+
+torch==2.8.0+cpu
+
+langchain-text-splitters==1.1.2
+langchain-huggingface==1.2.2
+sentence-transformers==6.1.0
+
+qdrant-client==1.19.1
