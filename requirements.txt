@@ -2,11 +2,12 @@
 
 python-dotenv==1.1.1
 requests==2.34.2
-
 torch==2.8.0+cpu
-
 langchain-text-splitters==1.1.2
 langchain-huggingface==1.2.2
 sentence-transformers==6.1.0
-
 qdrant-client==1.19.1
+certifi==2026.7.22
+charset-normalizer==3.5.1
+idna==3.20
+urllib3==2.8.0
